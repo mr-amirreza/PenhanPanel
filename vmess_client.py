@@ -28,7 +28,8 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
-_VMESS_CMDKEY_SALT = b"c48619-8e43-4a32-944f-e7d52029b488"
+import hmac
+_VMESS_CMDKEY_SALT = b"c48619fe-8f02-49e0-b9e9-edf763e17e21"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -44,15 +45,10 @@ def _hmac_custom(hash_fn, key: bytes, msg: bytes, block: int = 64) -> bytes:
 
 
 def vmess_kdf(key: bytes, *path: bytes) -> bytes:
-    def level(n: int):
-        val = b"VMess Reconstruction"
-        for _ in range(n):
-            val = _hmac_custom(hashlib.sha256, key, val)
-        return val
-    out = b""
-    for idx, item in enumerate(path, start=1):
-        out += _hmac_custom(hashlib.sha256, level(idx), item)
-    return out
+    h = hmac.new(b"VMess AEAD KDF", key, hashlib.sha256).digest()
+    for p in path:
+        h = hmac.new(h, p, hashlib.sha256).digest()
+    return h
 
 
 def vmess_kdf16(key: bytes, *path: bytes) -> bytes:
@@ -158,18 +154,56 @@ class _VMessChunkCrypto:
 # Link Parsing
 # ══════════════════════════════════════════════════════════════════════════════
 def parse_vmess_link(raw_link: str) -> dict:
-    """Parse a vmess:// link (Base64 JSON) into a standardized dictionary."""
+    """Parse a vmess:// link (Base64 JSON or URI-style) into a standardized dictionary."""
     raw = str(raw_link or "").strip()
     if not raw.startswith("vmess://"):
         raise ValueError("Invalid VMess link: must start with vmess://")
 
-    b64_part = raw[len("vmess://"):].strip()
-    pad = len(b64_part) % 4
+    body = raw[len("vmess://"):].strip()
+
+    # Check for URL-style: vmess://uuid@host:port?...#remark
+    if "@" in body:
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            uuid_str = parsed.username or ""
+            address = parsed.hostname or ""
+            port = parsed.port or 443
+            ps = urllib.parse.unquote(parsed.fragment or "")
+            params = urllib.parse.parse_qs(parsed.query)
+            net = (params.get("type", ["tcp"])[0] or params.get("net", ["tcp"])[0]).lower()
+            path = params.get("path", ["/"])[0]
+            host = params.get("host", [""])[0]
+            sni = params.get("sni", [""])[0] or host or address
+            security = (params.get("security", ["none"])[0]).lower()
+            tls = security == "tls" or params.get("tls", [""])[0] == "tls" or port == 443
+            aid = int(params.get("aid", [0])[0] or params.get("alterId", [0])[0] or 0)
+            scy = params.get("encryption", ["auto"])[0]
+            if not address or not uuid_str:
+                raise ValueError("VMess link missing address or uuid")
+            return {
+                "address": address,
+                "port": port,
+                "uuid": uuid_str,
+                "aid": aid,
+                "net": net,
+                "path": path if path.startswith("/") else "/" + path,
+                "host": host or sni or address,
+                "tls": bool(tls),
+                "sni": sni,
+                "ps": ps,
+                "scy": scy,
+                "raw": raw,
+            }
+        except Exception as exc:
+            pass
+
+    # Base64 JSON style (v2rayN format)
+    pad = len(body) % 4
     if pad:
-        b64_part += "=" * (4 - pad)
+        body += "=" * (4 - pad)
 
     try:
-        decoded = base64.b64decode(b64_part).decode("utf-8", errors="ignore")
+        decoded = base64.b64decode(body).decode("utf-8", errors="ignore")
         data = json.loads(decoded)
     except Exception as exc:
         raise ValueError(f"Failed to decode vmess:// payload: {exc}")
@@ -186,7 +220,8 @@ def parse_vmess_link(raw_link: str) -> dict:
     if not path.startswith("/"):
         path = "/" + path
     host = str(data.get("host") or "").strip()
-    tls = str(data.get("tls") or "").strip().lower()
+    tls_val = str(data.get("tls") or "").strip().lower()
+    tls = tls_val == "tls" or port == 443
     sni = str(data.get("sni") or host or address).strip()
     ps = str(data.get("ps") or "").strip()
     scy = str(data.get("scy") or "auto").strip().lower()
@@ -202,7 +237,7 @@ def parse_vmess_link(raw_link: str) -> dict:
         "net": net,
         "path": path,
         "host": host or sni or address,
-        "tls": tls == "tls" or port == 443,
+        "tls": tls,
         "sni": sni,
         "ps": ps,
         "scy": scy,
@@ -522,7 +557,7 @@ async def vmess_connect_stream_pair(
 # ══════════════════════════════════════════════════════════════════════════════
 # Proxy Connectivity & Latency Tester
 # ══════════════════════════════════════════════════════════════════════════════
-async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 6.0) -> dict:
+async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
     """Test connecting through a VMess proxy to verify latency and egress IP."""
     result = {
         "protocol": "vmess",
@@ -562,8 +597,22 @@ async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 6.0) -> dict:
                 result["egress_ip"] = ips[0]
 
         result["working"] = True
+    except asyncio.TimeoutError:
+        result["error"] = "سرور پاسخ نمی‌دهد (Timeout / مسدود است)"
+    except ConnectionRefusedError:
+        result["error"] = "ارتباط رد شد (پورت مقصد بسته است)"
+    except ConnectionResetError:
+        result["error"] = "ارتباط قطع شد (احتمالاً کانفیگ نامعتبر یا منقضی)"
     except Exception as exc:
-        result["error"] = str(exc)[:200] or type(exc).__name__
+        msg = str(exc)
+        if "WebSocket upgrade rejected" in msg:
+            result["error"] = "وب‌سوکت رد شد (سایت مقصد مسدود یا 404)"
+        elif "Name or service not known" in msg or "getaddrinfo failed" in msg:
+            result["error"] = "آدرس دامنه سرور یافت نشد (DNS Error)"
+        elif type(exc).__name__ == "TimeoutError":
+            result["error"] = "سرور پاسخ نمی‌دهد (Timeout / مسدود است)"
+        else:
+            result["error"] = msg[:160] or type(exc).__name__
     finally:
         if tunnel:
             await tunnel.close()
