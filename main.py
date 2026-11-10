@@ -30,7 +30,27 @@ import subprocess
 import tempfile
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+from logging.handlers import RotatingFileHandler
+
+MAX_LOG_BYTES = int(os.environ.get("MAX_LOG_MB", 5)) * 1024 * 1024  # Default 5 MB limit
+LOG_BACKUP_COUNT = int(os.environ.get("LOG_BACKUPS", 1))            # Max 1 backup
+
+_log_format = "%(asctime)s [%(levelname)s] %(message)s"
+_root_logger = logging.getLogger()
+_root_logger.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+# Setup stream handler
+for _h in list(_root_logger.handlers):
+    _root_logger.removeHandler(_h)
+_console_handler = logging.StreamHandler()
+_console_handler.setFormatter(logging.Formatter(_log_format))
+_root_logger.addHandler(_console_handler)
+
+# Suppress high-frequency connection spam on console
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("websockets.server").setLevel(logging.WARNING)
+logging.getLogger("websockets.protocol").setLevel(logging.WARNING)
+
 logger = logging.getLogger("Spider-Gateway")
 
 try:
@@ -78,6 +98,7 @@ import twp as _twp
 # `sys.modules["main"]` lookups always resolve to THIS module.
 import tm as _tm
 import relays as _relays
+import vmess_client as _vmess_client
 
 _tm_load_state = _tm.load_state
 _tm_dump_state = _tm.dump_state
@@ -89,17 +110,17 @@ app = FastAPI(title="Spider Gateway", docs_url=None, redoc_url=None)
 # Import and include xhttp_siz10 router - deferred until globals are defined
 xhttp_router = None
 
-PANEL_PORT = 8080
+def _env_port(default: int = 8080) -> int:
+    for k in ("PORT", "SERVER_PORT"):
+        v = os.environ.get(k)
+        if v:
+            try:
+                return int(v)
+            except Exception:
+                pass
+    return default
 
-
-def _env_port(default: int = PANEL_PORT) -> int:
-    """Return the canonical SpiderPanel listen port.
-
-    Provider-injected PORT values are intentionally ignored. The panel itself
-    always listens on 8080; a platform reverse proxy may still expose another
-    public port/domain in front of it.
-    """
-    return PANEL_PORT
+PANEL_PORT = _env_port(8080)
 
 
 CONFIG = {
@@ -119,7 +140,42 @@ app.add_middleware(
 )
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+def _resolve_data_dir() -> Path:
+    env_dir = os.environ.get("DATA_DIR")
+    if env_dir:
+        p = Path(env_dir)
+        try:
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+        except Exception:
+            pass
+    try:
+        p = Path("/data")
+        if p.exists():
+            test_file = p / ".test_write"
+            test_file.touch(exist_ok=True)
+            test_file.unlink(missing_ok=True)
+            return p
+    except Exception:
+        pass
+    p = Path(os.path.dirname(os.path.abspath(__file__))) / "data"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+DATA_DIR = _resolve_data_dir()
+
+# Add rotating file handler with strict size limit to DATA_DIR
+try:
+    _file_handler = RotatingFileHandler(
+        DATA_DIR / "spider.log",
+        maxBytes=MAX_LOG_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8"
+    )
+    _file_handler.setFormatter(logging.Formatter(_log_format))
+    _root_logger.addHandler(_file_handler)
+except Exception:
+    pass
 DATA_FILE = DATA_DIR / "spider_state.json"
 SAVE_LOCK = asyncio.Lock()
 
@@ -537,7 +593,7 @@ stats = {
     "start_time": time.time(),
 }
 error_logs: deque = deque(maxlen=500)
-activity_logs: deque = deque(maxlen=2000)
+activity_logs: deque = deque(maxlen=500)
 hourly_traffic: dict = defaultdict(int)
 http_client: httpx.AsyncClient | None = None
 LINKS: dict = {}
@@ -1660,6 +1716,31 @@ async def _twp_session_sweeper():
 
 
 # ── Startup / Shutdown ────────────────────────────────────────────────────────
+async def _log_size_guard_loop():
+    """Periodically check all .log files and truncate if they exceed MAX_LOG_BYTES."""
+    while True:
+        try:
+            await asyncio.sleep(600)  # Check every 10 minutes
+            _dirs = [DATA_DIR, Path(os.path.dirname(os.path.abspath(__file__))) / "xray", Path(".")]
+            for d in _dirs:
+                if not d.exists():
+                    continue
+                for f in d.glob("*.log"):
+                    try:
+                        if f.is_file() and f.stat().st_size > MAX_LOG_BYTES:
+                            with open(f, "rb") as fp:
+                                fp.seek(-min(f.stat().st_size, 256 * 1024), os.SEEK_END)
+                                tail = fp.read()
+                            with open(f, "wb") as fp:
+                                fp.write(tail)
+                            logger.info(f"Log file {f.name} truncated to prevent filling disk.")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            await asyncio.sleep(60)
+
 @app.on_event("startup")
 async def startup():
     global http_client
@@ -2110,6 +2191,7 @@ async def startup():
     asyncio.create_task(_worker_proxy_sync_loop())
     asyncio.create_task(_worker_auto_sync_loop())
     asyncio.create_task(_xray_client_audit_loop())
+    asyncio.create_task(_log_size_guard_loop(), name="spider-log-guard")
     global BOT_SCHEDULER_TASK, BOT_POLL_TASK, BOT_EXPIRY_TASK
     if BOT_SCHEDULER_TASK is None or BOT_SCHEDULER_TASK.done():
         BOT_SCHEDULER_TASK = asyncio.create_task(_channel_bot_loop(), name="spider-channel-bot")
@@ -11147,6 +11229,21 @@ def _parse_proxy_entry(entry: str) -> dict | None:
     if not entry:
         return None
     e = str(entry).strip()
+    if e.startswith("vmess://"):
+        try:
+            parsed = _vmess_client.parse_vmess_link(e)
+            return {
+                "protocol": "vmess",
+                "protocol_explicit": True,
+                "hostname": parsed["address"],
+                "port": parsed["port"],
+                "username": "",
+                "password": "",
+                "vmess_cfg": parsed,
+                "raw": e,
+            }
+        except Exception:
+            return None
     # Strip leading protocol
     proto = "http"
     m = _re.match(r"^(socks5|socks4|http|https|turn|sstp)://", e, _re.I)
@@ -11579,6 +11676,10 @@ def _proxy_entry_string(proxy: dict) -> str:
     """One-line protocol-specific proxy entry consumed by the relay."""
     if not proxy:
         return ""
+    if str(proxy.get("protocol") or "").lower() == "vmess":
+        raw = str(proxy.get("raw_link") or proxy.get("raw") or (proxy.get("vmess_config") or {}).get("raw") or "").strip()
+        if raw:
+            return raw
     host = str(proxy.get("host") or proxy.get("hostname") or "").strip()
     port = str(proxy.get("port") or "").strip()
     if not host or not port:
@@ -11597,6 +11698,21 @@ def _proxy_entry_string(proxy: dict) -> str:
 
 
 async def _try_proxy_order(proxy, address, port):
+    if str(proxy.get("protocol") or "").lower() == "vmess":
+        try:
+            vmess_cfg = proxy.get("vmess_cfg") or proxy.get("vmess_config")
+            if not vmess_cfg and proxy.get("raw"):
+                vmess_cfg = _vmess_client.parse_vmess_link(proxy["raw"])
+            if not vmess_cfg and proxy.get("raw_link"):
+                vmess_cfg = _vmess_client.parse_vmess_link(proxy["raw_link"])
+            if vmess_cfg:
+                reader, writer = await _vmess_client.vmess_connect_stream_pair(vmess_cfg, address, port)
+                _tune_relay_socket(writer)
+                return reader, writer
+        except Exception as exc:
+            logger.warning("VMess outbound connect failed: %s", exc)
+            return None
+
     for protocol in _order_for(
         proxy.get("protocol", "http"), bool(proxy.get("protocol_explicit"))
     ):
@@ -12207,6 +12323,12 @@ async def _xray_start(config: dict) -> bool:
             return False
         try:
             log_path = bin_path.parent / "xray-runtime.log"
+            if log_path.exists() and log_path.stat().st_size > MAX_LOG_BYTES:
+                try:
+                    with open(log_path, "wb") as _trunc_f:
+                        _trunc_f.write(b"")
+                except Exception:
+                    pass
             log_fp = open(log_path, "ab", buffering=0)
             _xray_proc = await asyncio.create_subprocess_exec(
                 str(bin_path), "-c", str(cfg_path),
@@ -14846,7 +14968,20 @@ async def _proxy_test_connect_once(proxy: dict) -> dict:
 
 
 async def _proxy_test_connect(proxy: dict) -> dict:
-    """Detect SOCKS4/5 and HTTP/HTTPS, selecting the fastest working tunnel."""
+    """Detect SOCKS4/5, HTTP/HTTPS, or VMess, selecting the fastest working tunnel."""
+    raw_link = str(proxy.get("raw_link") or proxy.get("raw") or "").strip()
+    if str(proxy.get("protocol") or "").lower() == "vmess" or raw_link.startswith("vmess://"):
+        try:
+            vmess_cfg = proxy.get("vmess_config") or _vmess_client.parse_vmess_link(raw_link)
+        except Exception as exc:
+            return {"protocol": "vmess", "ping_ms": None, "egress_ip": "", "working": False, "error": f"Invalid VMess link: {exc}"}
+        res = await _vmess_client.test_vmess_proxy(vmess_cfg)
+        if res.get("egress_ip"):
+            geo = await _proxy_ip_geo(res["egress_ip"])
+            if geo:
+                res.update(geo)
+        return res
+
     protocols = ("socks4", "socks5", "http", "https")
     host = str(proxy.get("host") or "").strip()
     try:
@@ -15040,7 +15175,15 @@ async def create_proxy(request: Request, _=Depends(require_auth)):
     """Create a new external proxy after a successful connection test."""
     body = await request.json()
     protocol = str(body.get("protocol") or "").lower()
-    if protocol not in ("socks4", "socks5", "http", "https"):
+    raw_link = str(body.get("raw_link") or body.get("raw") or "").strip()
+    vmess_cfg = None
+    if protocol == "vmess" or raw_link.startswith("vmess://"):
+        protocol = "vmess"
+        try:
+            vmess_cfg = body.get("vmess_config") or _vmess_client.parse_vmess_link(raw_link)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid VMess link: {exc}")
+    elif protocol not in ("socks4", "socks5", "http", "https"):
         detection = await _proxy_test_connect({
             "host": str(body.get("host") or "").strip(),
             "port": body.get("port"),
@@ -15050,13 +15193,17 @@ async def create_proxy(request: Request, _=Depends(require_auth)):
         if not detection.get("working"):
             raise HTTPException(status_code=400, detail=detection.get("error") or "proxy connection failed")
         protocol = str(detection.get("protocol") or "")
-    host = str(body.get("host") or "").strip()[:255]
-    try:
-        port = int(body.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    if not host or not (1 <= port <= 65535):
-        raise HTTPException(status_code=400, detail="host and valid port required")
+    if protocol == "vmess" and vmess_cfg:
+        host = vmess_cfg["address"][:255]
+        port = int(vmess_cfg["port"])
+    else:
+        host = str(body.get("host") or "").strip()[:255]
+        try:
+            port = int(body.get("port") or 0)
+        except (TypeError, ValueError):
+            port = 0
+        if not host or not (1 <= port <= 65535):
+            raise HTTPException(status_code=400, detail="host and valid port required")
     username = str(body.get("username") or "").strip()[:128]
     password = str(body.get("password") or "").strip()[:256]
     # An explicitly typed country takes precedence over autodetection.
@@ -15130,6 +15277,9 @@ async def create_proxy(request: Request, _=Depends(require_auth)):
             "last_test_at": now,
             "created_at": now,
             "error": "",
+            "raw_link": raw_link if protocol == "vmess" else "",
+            "vmess_config": vmess_cfg if protocol == "vmess" else None,
+            "remark": str(body.get("remark") or (vmess_cfg.get("ps") if vmess_cfg else "") or "").strip(),
         }
         proxy_snapshot = dict(PROXIES[proxy_id])
     await _ensure_proxy_inbound(proxy_snapshot)
@@ -15137,6 +15287,141 @@ async def create_proxy(request: Request, _=Depends(require_auth)):
     log_activity("proxy", f"پروکسی {cname or ccode} ({protocol} {host}:{port}) ذخیره شد", "ok")
     async with PROXIES_LOCK:
         return {"ok": True, "proxy": _mask_proxy_password(PROXIES[proxy_id])}
+
+@app.post("/api/proxies/import-vmess")
+async def import_vmess_proxies(request: Request, _=Depends(require_auth)):
+    """Parse, test and geolocate multiple vmess:// links in parallel."""
+    body = await request.json()
+    raw_links = body.get("links") or []
+    if isinstance(raw_links, str):
+        raw_links = [line.strip() for line in raw_links.splitlines() if line.strip()]
+    raw_text = str(body.get("text") or "").strip()
+    if raw_text:
+        raw_links.extend([line.strip() for line in raw_text.splitlines() if line.strip()])
+
+    unique_links = []
+    seen = set()
+    for l in raw_links:
+        l = l.strip()
+        if l.startswith("vmess://") and l not in seen:
+            seen.add(l)
+            unique_links.append(l)
+
+    if not unique_links:
+        raise HTTPException(status_code=400, detail="هیچ لینک معتبر vmess:// یافت نشد")
+
+    unique_links = unique_links[:50]
+    semaphore = asyncio.Semaphore(10)
+
+    async def test_one(link: str):
+        async with semaphore:
+            try:
+                cfg = _vmess_client.parse_vmess_link(link)
+                res = await _vmess_client.test_vmess_proxy(cfg)
+                if res.get("egress_ip"):
+                    geo = await _proxy_ip_geo(res["egress_ip"])
+                    if geo:
+                        res.update(geo)
+                res["raw_link"] = link
+                res["vmess_config"] = cfg
+                return res
+            except Exception as e:
+                return {
+                    "protocol": "vmess",
+                    "raw_link": link,
+                    "working": False,
+                    "error": str(e)[:160],
+                    "remark": "",
+                    "host": "",
+                    "port": 0,
+                    "ping_ms": None,
+                    "egress_ip": "",
+                    "country": "",
+                    "country_flag": "🌐",
+                }
+
+    results = await asyncio.gather(*(test_one(l) for l in unique_links))
+    return {
+        "ok": True,
+        "total": len(unique_links),
+        "working_count": sum(1 for r in results if r.get("working")),
+        "results": results,
+    }
+
+
+@app.post("/api/proxies/batch-save")
+async def batch_save_proxies(request: Request, _=Depends(require_auth)):
+    """Save multiple tested VMess proxies into the panel at once."""
+    body = await request.json()
+    items = body.get("proxies") or []
+    if not isinstance(items, list) or not items:
+        raise HTTPException(status_code=400, detail="لیست پروکسی‌ها خالی است")
+
+    saved_items = []
+    now = now_ir().isoformat(timespec="seconds")
+    async with PROXIES_LOCK:
+        for item in items:
+            raw_link = str(item.get("raw_link") or item.get("raw") or "").strip()
+            if not raw_link.startswith("vmess://"):
+                continue
+            try:
+                vmess_cfg = item.get("vmess_config") or _vmess_client.parse_vmess_link(raw_link)
+            except Exception:
+                continue
+
+            host = vmess_cfg["address"]
+            port = vmess_cfg["port"]
+            cname = str(item.get("country_name") or item.get("country") or "").strip()
+            ccode = str(item.get("country_code") or "").strip().upper()
+            cflag = str(item.get("country_flag") or "").strip()
+            if not cflag and ccode:
+                cflag = _flag(ccode)
+            if not cname and ccode:
+                cname = _COUNTRY_NAMES.get(ccode, ccode)
+            if not cname:
+                cname = "VMess"
+            if not cflag:
+                cflag = "🌐"
+
+            proxy_id = secrets.token_hex(4)
+            remark = str(item.get("remark") or vmess_cfg.get("ps") or "").strip()
+            display_name = f"{cflag} {remark or cname}".strip()
+
+            proxy_rec = {
+                "id": proxy_id,
+                "protocol": "vmess",
+                "protocol_detected": True,
+                "name": display_name,
+                "host": host,
+                "port": port,
+                "username": "",
+                "password": "",
+                "country": cname,
+                "country_code": ccode,
+                "country_flag": cflag,
+                "active": True,
+                "ping_ms": item.get("ping_ms"),
+                "working": bool(item.get("working", True)),
+                "egress_ip": str(item.get("egress_ip") or ""),
+                "last_test_at": now,
+                "created_at": now,
+                "error": "",
+                "raw_link": raw_link,
+                "vmess_config": vmess_cfg,
+                "remark": remark,
+            }
+            PROXIES[proxy_id] = proxy_rec
+            saved_items.append(proxy_rec)
+
+    for p in saved_items:
+        await _ensure_proxy_inbound(p)
+
+    if saved_items:
+        await save_state()
+        log_activity("proxy", f"{len(saved_items)} پروکسی VMess با موفقیت اضافه شد", "ok")
+
+    return {"ok": True, "saved_count": len(saved_items)}
+
 
 @app.patch("/api/proxies/{proxy_id}")
 async def update_proxy(proxy_id: str, request: Request, _=Depends(require_auth)):
@@ -15210,8 +15495,11 @@ def _proxy_config_link(user: dict, uid: str, proxy: dict, cfg_uuid: str, pxiid: 
     """Build the extra LINK that backs a user's proxy-bound config."""
     country = str(proxy.get("country") or "Proxy")
     flag = str(proxy.get("country_flag") or "")
+    remark = str(proxy.get("remark") or "").strip()
+    proto_label = " [VMess]" if str(proxy.get("protocol") or "").lower() == "vmess" else ""
+    disp = f"{flag} {remark or country}{proto_label}".strip()
     return {
-        "label": f"{user.get('username', uid)} {flag} {country}".strip(),
+        "label": f"{user.get('username', uid)} {disp}".strip(),
         "limit_bytes": int(user.get("traffic_limit_bytes") or 0),
         "used_bytes": 0,
         "created_at": now_ir().isoformat(timespec="seconds"),

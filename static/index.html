@@ -2089,7 +2089,18 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
 
           <!-- ADD FORM -->
           <div class="px-add hidden" id="px-add">
-            <div class="f-r" style="margin-top:12px">
+            <div style="display:flex;gap:8px;margin-top:12px;margin-bottom:12px">
+              <button type="button" class="btn btn-sm btn-p" id="px-mode-manual-btn" onclick="pxSetAddMode('manual')" style="flex:1">
+                پروکسی دستی (SOCKS / HTTP)
+              </button>
+              <button type="button" class="btn btn-sm btn-g" id="px-mode-vmess-btn" onclick="pxSetAddMode('vmess')" style="flex:1">
+                🚀 وارد کردن لینک‌های VMess
+              </button>
+            </div>
+
+            <!-- MANUAL FORM -->
+            <div id="px-pane-manual">
+            <div class="f-r" style="margin-top:8px">
               <div class="f-g"><label data-i18n="proxy.host">آدرس (IP یا دامنه)</label><input id="px-host" type="text" dir="ltr" placeholder="1.2.3.4" autocomplete="off" oninput="pxInvalidateTest()"></div>
               <div class="f-g"><label data-i18n="proxy.port">پورت</label><input id="px-port" type="number" min="1" max="65535" dir="ltr" placeholder="1080" oninput="pxInvalidateTest()"></div>
             </div>
@@ -2119,6 +2130,24 @@ button:focus-visible, a:focus-visible, input:focus-visible, select:focus-visible
               <span class="material-symbols-outlined" style="font-size:16px">save</span>
               <span data-i18n="proxy.save">ذخیره پروکسی</span>
             </button>
+            </div><!-- /px-pane-manual -->
+
+            <!-- VMESS BATCH FORM -->
+            <div id="px-pane-vmess" class="hidden">
+              <div class="px-hint" style="margin-bottom:8px">
+                یک یا چند لینک <code>vmess://</code> را وارد کنید (هر خط یک لینک). پنل تمام لینک‌ها را همزمان تست کرده، پینگ و کشور را استخراج می‌کند.
+              </div>
+              <textarea id="px-vmess-input" dir="ltr" rows="4" style="width:100%;box-sizing:border-box;font-family:monospace;background:var(--bg2,#151515);border:1px solid var(--border);border-radius:10px;padding:10px;color:var(--txt);font-size:11px;resize:vertical" placeholder="vmess://eyJhZGQiOiIxLjIuMy40IiwicG9ydCI6NDQzLCJpZCI6Ii4uLiIsIm5ldCI6IndzIiwidGxzIjoidGxzIiwicHMiOiJTZXJ2ZXItMDEifQ==&#10;vmess://..."></textarea>
+              <button class="btn btn-g" style="width:100%;margin-top:10px" type="button" id="px-vmess-test-btn" onclick="pxTestVmessBatch()">
+                <span class="material-symbols-outlined" style="font-size:16px">network_check</span>
+                <span>تست و بررسی کانفیگ‌ها</span>
+              </button>
+              <div id="px-vmess-results" style="margin-top:10px;display:none"></div>
+              <button class="btn btn-p hidden" style="width:100%;margin-top:10px" type="button" id="px-vmess-save-btn" onclick="pxSaveVmessBatch()">
+                <span class="material-symbols-outlined" style="font-size:16px">save</span>
+                <span id="px-vmess-save-lbl">ذخیره کانفیگ‌های فعال</span>
+              </button>
+            </div><!-- /px-pane-vmess -->
           </div>
 
           <div id="proxy-list" style="margin-top:6px"></div>
@@ -7303,14 +7332,16 @@ function pxRow(label, value) {
 }
 
 function pxCardHtml(p) {
+  var isVmess = (p.protocol || '').toLowerCase() === 'vmess';
   var statusTxt = p.active ? (p.working ? t('proxy.ok') : t('proxy.untested')) : t('proxy.off');
   var statusCls = p.active ? (p.working ? 'badge-g' : 'badge-b') : 'badge-r';
   var accId = 'px-' + String(p.id);
+  var title = p.remark || p.name || p.country || p.host;
   return '<div class="spd-acc px-card' + (p.active ? '' : ' off') + '" id="px-card-' + escAttr(p.id) + '">' +
     '<button type="button" class="spd-acc-head px-head" onclick="spdToggleAcc(\'' + escAttr(accId) + '\',this)" aria-expanded="false" aria-controls="acc-' + escAttr(accId) + '">' +
       '<span class="px-flag">' + esc(p.country_flag || '🌐') + '</span>' +
-      '<span class="px-meta"><b>' + esc(p.country || p.host) + '</b>' +
-        '<span>' + esc(p.protocol) + ' · ' + esc(p.host) + ':' + esc(String(p.port)) + (p.username ? ' · ' + esc(p.username) : '') + '</span></span>' +
+      '<span class="px-meta"><b>' + esc(title) + '</b>' +
+        '<span>' + (isVmess ? '<span class="badge badge-g" style="font-size:9px;padding:1px 5px">VMess</span> ' : '') + esc(p.protocol) + ' · ' + esc(p.host) + ':' + esc(String(p.port)) + (p.username ? ' · ' + esc(p.username) : '') + '</span></span>' +
       '<span class="badge ' + statusCls + '">' + esc(statusTxt) + '</span>' +
       '<span class="material-symbols-outlined spd-acc-arrow">expand_more</span>' +
     '</button>' +
@@ -7365,6 +7396,107 @@ async function pxDelete(pid) {
     await loadProxies();
     await loadInbounds();
   } catch (e) { toast(e.message || t('toast.err'), 'err'); }
+}
+
+// ═══ VMESS BATCH PROXY IMPORT ═══
+var PX_VMESS_RESULTS = [];
+
+function pxSetAddMode(mode) {
+  var manualPane = $id('px-pane-manual'), vmessPane = $id('px-pane-vmess');
+  var manualBtn = $id('px-mode-manual-btn'), vmessBtn = $id('px-mode-vmess-btn');
+  if (mode === 'vmess') {
+    if (manualPane) manualPane.classList.add('hidden');
+    if (vmessPane) vmessPane.classList.remove('hidden');
+    if (manualBtn) { manualBtn.className = 'btn btn-sm btn-g'; }
+    if (vmessBtn) { vmessBtn.className = 'btn btn-sm btn-p'; }
+  } else {
+    if (manualPane) manualPane.classList.remove('hidden');
+    if (vmessPane) vmessPane.classList.add('hidden');
+    if (manualBtn) { manualBtn.className = 'btn btn-sm btn-p'; }
+    if (vmessBtn) { vmessBtn.className = 'btn btn-sm btn-g'; }
+  }
+}
+
+async function pxTestVmessBatch() {
+  var input = $id('px-vmess-input');
+  var text = (input ? input.value : '').trim();
+  if (!text) {
+    toast('لطفاً حداقل یک لینک vmess:// وارد کنید', 'err');
+    return;
+  }
+  var btn = $id('px-vmess-test-btn');
+  var resBox = $id('px-vmess-results');
+  var saveBtn = $id('px-vmess-save-btn');
+  if (btn) btn.disabled = true;
+  if (resBox) {
+    resBox.style.display = 'block';
+    resBox.innerHTML = '<div style="color:var(--txt2);padding:10px;text-align:center">⏳ در حال تست و اعتبارسنجی کانفیگ‌ها...</div>';
+  }
+  if (saveBtn) saveBtn.classList.add('hidden');
+  try {
+    var res = await api('/api/proxies/import-vmess', {
+      method: 'POST',
+      body: { text: text }
+    });
+    PX_VMESS_RESULTS = res.results || [];
+    var working = PX_VMESS_RESULTS.filter(function(r) { return r.working; });
+    var html = '<div style="font-size:12px;margin-bottom:8px;display:flex;justify-content:space-between"><span>تعداد کل: <b>' + res.total + '</b></span><span style="color:var(--green)">سالم: <b>' + working.length + '</b></span></div>';
+    html += '<div style="max-height:260px;overflow-y:auto;display:flex;flex-direction:column;gap:6px">';
+    PX_VMESS_RESULTS.forEach(function(r, idx) {
+      var isOk = r.working;
+      var flag = r.country_flag || '🌐';
+      var name = r.remark || r.country || ('VMess #' + (idx + 1));
+      var ping = r.ping_ms != null ? (r.ping_ms + ' ms') : '—';
+      html += '<div style="padding:8px 10px;border-radius:8px;background:var(--bg2,#1b1b1b);border:1px solid ' + (isOk ? 'var(--green)' : 'var(--border)') + ';display:flex;align-items:center;justify-content:space-between;font-size:11px">' +
+        '<div style="display:flex;align-items:center;gap:8px">' +
+          '<span style="font-size:16px">' + flag + '</span>' +
+          '<div><div style="font-weight:bold">' + esc(name) + '</div><div style="color:var(--txt2);font-size:10px">' + esc(r.host) + ':' + r.port + (r.egress_ip ? ' (IP: ' + esc(r.egress_ip) + ')' : '') + '</div></div>' +
+        '</div>' +
+        '<div>' + (isOk ? '<span class="badge badge-g">' + ping + '</span>' : '<span class="badge badge-r" title="' + escAttr(r.error || '') + '">' + esc(r.error || 'خطا') + '</span>') + '</div>' +
+      '</div>';
+    });
+    html += '</div>';
+    if (resBox) resBox.innerHTML = html;
+    if (working.length > 0 && saveBtn) {
+      saveBtn.classList.remove('hidden');
+      var lbl = $id('px-vmess-save-lbl');
+      if (lbl) lbl.textContent = 'ذخیره ' + working.length + ' کانفیگ فعال';
+    }
+    toast('تست انجام شد: ' + working.length + ' کانفیگ فعال', working.length ? 'ok' : 'warn');
+  } catch (e) {
+    if (resBox) resBox.innerHTML = '<div style="color:var(--red);padding:10px">' + esc(e.message || 'خطا در تست') + '</div>';
+    toast(e.message || 'خطا در تست', 'err');
+  }
+  if (btn) btn.disabled = false;
+}
+
+async function pxSaveVmessBatch() {
+  var working = PX_VMESS_RESULTS.filter(function(r) { return r.working; });
+  if (!working.length) {
+    toast('هیچ کانفیگ فعالی برای ذخیره وجود ندارد', 'warn');
+    return;
+  }
+  var btn = $id('px-vmess-save-btn');
+  if (btn) btn.disabled = true;
+  try {
+    var res = await api('/api/proxies/batch-save', {
+      method: 'POST',
+      body: { proxies: working }
+    });
+    toast(res.saved_count + ' پروکسی VMess با موفقیت ذخیره شد', 'ok');
+    var addBox = $id('px-add');
+    if (addBox) addBox.classList.add('hidden');
+    PX_VMESS_RESULTS = [];
+    var inp = $id('px-vmess-input');
+    if (inp) inp.value = '';
+    var rbox = $id('px-vmess-results');
+    if (rbox) { rbox.innerHTML = ''; rbox.style.display = 'none'; }
+    await loadProxies();
+    await loadInbounds();
+  } catch (e) {
+    toast(e.message || 'خطا در ذخیره', 'err');
+  }
+  if (btn) btn.disabled = false;
 }
 
 // ═══ PER-INBOUND CONFIG OPTIONS (create-user modal) ═══
