@@ -15324,13 +15324,20 @@ async def import_vmess_proxies(request: Request, _=Depends(require_auth)):
                         res.update(geo)
                 res["raw_link"] = link
                 res["vmess_config"] = cfg
+                # Also log summary to panel log
+                status_str = "OK" if res.get("working") else "FAIL"
+                logger.info(f"[VMess-Test] {status_str} {cfg.get('address')}:{cfg.get('port')} -> {res.get('error') or 'connected'}")
                 return res
             except Exception as e:
+                err_msg = str(e)[:160]
                 return {
                     "protocol": "vmess",
                     "raw_link": link,
                     "working": False,
-                    "error": str(e)[:160],
+                    "error": err_msg,
+                    "diagnosis_fa": f"خطا در خواندن یا ساختار لینک: {err_msg}",
+                    "trace": [{"time_ms": 0.0, "stage": "CONFIG", "status": "error", "message": f"خطای ساختار: {err_msg}", "detail": ""}],
+                    "trace_text": f"0.0ms [ERR]  [CONFIG]  خطای ساختار لینک: {err_msg}",
                     "remark": "",
                     "host": "",
                     "port": 0,

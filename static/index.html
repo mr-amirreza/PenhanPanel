@@ -7447,12 +7447,19 @@ async function pxTestVmessBatch() {
       var flag = r.country_flag || '🌐';
       var name = r.remark || r.country || ('VMess #' + (idx + 1));
       var ping = r.ping_ms != null ? (r.ping_ms + ' ms') : '—';
-      html += '<div style="padding:8px 10px;border-radius:8px;background:var(--bg2,#1b1b1b);border:1px solid ' + (isOk ? 'var(--green)' : 'var(--border)') + ';display:flex;align-items:center;justify-content:space-between;font-size:11px">' +
-        '<div style="display:flex;align-items:center;gap:8px">' +
-          '<span style="font-size:16px">' + flag + '</span>' +
-          '<div><div style="font-weight:bold">' + esc(name) + '</div><div style="color:var(--txt2);font-size:10px">' + esc(r.host) + ':' + r.port + (r.egress_ip ? ' (IP: ' + esc(r.egress_ip) + ')' : '') + '</div></div>' +
+      var diag = r.diagnosis_fa || r.error || '';
+      html += '<div style="padding:10px 12px;border-radius:8px;background:var(--bg2,#1b1b1b);border:1px solid ' + (isOk ? 'var(--green)' : 'var(--border)') + ';display:flex;flex-direction:column;gap:6px;font-size:11px">' +
+        '<div style="display:flex;align-items:center;justify-content:space-between">' +
+          '<div style="display:flex;align-items:center;gap:8px">' +
+            '<span style="font-size:16px">' + flag + '</span>' +
+            '<div><div style="font-weight:bold">' + esc(name) + '</div><div style="color:var(--txt2);font-size:10px">' + esc(r.host) + ':' + r.port + (r.egress_ip ? ' (IP: ' + esc(r.egress_ip) + ')' : '') + '</div></div>' +
+          '</div>' +
+          '<div style="display:flex;align-items:center;gap:6px">' +
+            '<button type="button" class="btn btn-xs" onclick="pxShowTrace(' + idx + ')" style="padding:3px 8px;font-size:10px;background:rgba(255,255,255,0.06);border:1px solid var(--border);border-radius:4px;cursor:pointer;color:var(--txt)">📋 لاگ عیب‌یابی</button>' +
+            (isOk ? '<span class="badge badge-g">' + ping + '</span>' : '<span class="badge badge-r" title="' + escAttr(r.error || '') + '">' + esc(r.error || 'خطا') + '</span>') +
+          '</div>' +
         '</div>' +
-        '<div>' + (isOk ? '<span class="badge badge-g">' + ping + '</span>' : '<span class="badge badge-r" title="' + escAttr(r.error || '') + '">' + esc(r.error || 'خطا') + '</span>') + '</div>' +
+        (diag ? '<div style="font-size:10px;color:' + (isOk ? 'var(--green)' : 'var(--txt2)') + ';padding-right:24px;border-top:1px dashed rgba(255,255,255,0.06);padding-top:4px">💡 ' + esc(diag) + '</div>' : '') +
       '</div>';
     });
     html += '</div>';
@@ -7468,6 +7475,55 @@ async function pxTestVmessBatch() {
     toast(e.message || 'خطا در تست', 'err');
   }
   if (btn) btn.disabled = false;
+}
+
+var PX_CURRENT_TRACE_TEXT = '';
+
+function pxShowTrace(idx) {
+  var r = (PX_VMESS_RESULTS || [])[idx];
+  if (!r) return;
+  var name = r.remark || (r.host + ':' + r.port);
+  var titleEl = $id('px-trace-title');
+  if (titleEl) titleEl.textContent = 'گزارش عیب‌یابی: ' + name;
+  var diagEl = $id('px-trace-diag');
+  if (diagEl) diagEl.textContent = r.diagnosis_fa || (r.working ? 'کانفیگ با موفقیت متصل شد.' : r.error);
+  PX_CURRENT_TRACE_TEXT = r.trace_text || (r.error || 'بدون لاگ');
+
+  var consoleEl = $id('px-trace-console');
+  if (consoleEl) {
+    if (r.trace && r.trace.length) {
+      var lines = r.trace.map(function(t) {
+        var color = '#8b949e';
+        if (t.status === 'ok') color = '#3fb950';
+        else if (t.status === 'error') color = '#f85149';
+        else if (t.status === 'warn') color = '#d29922';
+        var stagePill = '<span style="color:#58a6ff;font-weight:bold">[' + esc(t.stage) + ']</span>';
+        var timePill = '<span style="color:#6e7681">' + (t.time_ms != null ? (t.time_ms).toFixed(1) + 'ms' : '') + '</span>';
+        var msg = '<span style="color:' + color + '">' + esc(t.message) + '</span>';
+        var det = t.detail ? (' <span style="color:#8b949e">-> ' + esc(t.detail) + '</span>') : '';
+        return timePill + ' ' + stagePill + ' ' + msg + det;
+      });
+      consoleEl.innerHTML = lines.join('\n');
+    } else {
+      consoleEl.textContent = PX_CURRENT_TRACE_TEXT;
+    }
+  }
+  var modal = $id('px-trace-modal');
+  if (modal) modal.style.display = 'flex';
+}
+
+function pxCloseTrace() {
+  var modal = $id('px-trace-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function pxCopyTraceText() {
+  if (!PX_CURRENT_TRACE_TEXT) return;
+  navigator.clipboard.writeText(PX_CURRENT_TRACE_TEXT).then(function() {
+    toast('متن کامل لاگ عیب‌یابی کپی شد', 'ok');
+  }).catch(function() {
+    toast('خطا در کپی متن لاگ', 'err');
+  });
 }
 
 async function pxSaveVmessBatch() {
@@ -9432,5 +9488,30 @@ if (loginFormEl) {
 }
 
 </script>
+
+<!-- DIAGNOSTIC TRACE MODAL -->
+<div id="px-trace-modal" style="display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:99999;align-items:center;justify-content:center">
+  <div style="background:var(--bg,#161b22);border:1px solid var(--border,#30363d);border-radius:12px;max-width:680px;width:92%;max-height:85vh;display:flex;flex-direction:column;padding:18px;box-shadow:0 12px 32px rgba(0,0,0,0.6)">
+    <div style="display:flex;justify-content:space-between;align-items:center;border-bottom:1px solid var(--border,#30363d);padding-bottom:12px">
+      <div style="font-weight:bold;font-size:14px;display:flex;align-items:center;gap:6px">
+        <span>🔬</span> <span id="px-trace-title">گزارش عیب‌یابی و لاگ اتصال</span>
+      </div>
+      <button type="button" class="btn btn-sm" onclick="pxCloseTrace()" style="padding:2px 8px;font-size:14px">✕</button>
+    </div>
+    <div style="margin:12px 0 8px 0;padding:10px 12px;background:rgba(255,255,255,0.03);border-radius:8px;border:1px solid var(--border,#30363d);font-size:12px">
+      <div style="font-weight:bold;color:var(--txt,#e6edf3);margin-bottom:4px">💡 نتیجه تحلیل تشخیصی:</div>
+      <div id="px-trace-diag" style="color:var(--txt2,#8b949e);line-height:1.6"></div>
+    </div>
+    <div style="font-size:11px;font-weight:bold;margin-bottom:6px;display:flex;justify-content:space-between;align-items:center">
+      <span>مراحل تست (Step-by-Step Diagnostic Trace):</span>
+      <button type="button" class="btn btn-xs btn-g" onclick="pxCopyTraceText()" style="padding:2px 8px;cursor:pointer">📋 کپی متن لاگ</button>
+    </div>
+    <div id="px-trace-console" style="background:#0d1117;color:#c9d1d9;font-family:Consolas,monospace;font-size:11px;padding:12px;border-radius:8px;max-height:280px;overflow-y:auto;white-space:pre-wrap;line-height:1.7;direction:ltr;text-align:left;border:1px solid #30363d"></div>
+    <div style="margin-top:14px;display:flex;justify-content:flex-end">
+      <button type="button" class="btn btn-sm" onclick="pxCloseTrace()">بستن</button>
+    </div>
+  </div>
+</div>
+
 </body>
 </html>

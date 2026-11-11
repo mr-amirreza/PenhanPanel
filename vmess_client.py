@@ -33,6 +33,40 @@ _VMESS_CMDKEY_SALT = b"c48619fe-8f02-49e0-b9e9-edf763e17e21"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Diagnostic Trace & Step-by-Step Logger
+# ══════════════════════════════════════════════════════════════════════════════
+class DiagnosticTrace:
+    """Records high-resolution, step-by-step diagnostic events during proxy tests."""
+    def __init__(self):
+        self.logs = []
+        self.start_time = time.monotonic()
+
+    def add(self, stage: str, status: str, message: str, detail: str = ""):
+        elapsed = round((time.monotonic() - self.start_time) * 1000, 1)
+        self.logs.append({
+            "time_ms": elapsed,
+            "stage": stage,     # "CONFIG", "DNS", "TCP", "TLS", "WS", "AUTH", "PROBE"
+            "status": status,   # "info", "ok", "warn", "error"
+            "message": message,
+            "detail": detail,
+        })
+
+    def to_list(self) -> list:
+        return self.logs
+
+    def to_text(self) -> str:
+        lines = []
+        for l in self.logs:
+            st = f"[{l['stage']}]".ljust(9)
+            badge = "[OK]  " if l["status"] == "ok" else ("[ERR] " if l["status"] == "error" else "[INFO]")
+            line = f"{l['time_ms']:>6.1f}ms {badge} {st} {l['message']}"
+            if l.get("detail"):
+                line += f" -> {l['detail']}"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Crypto Helpers (Aligned with relays.py & VMess AEAD standard)
 # ══════════════════════════════════════════════════════════════════════════════
 def _hmac_custom(hash_fn, key: bytes, msg: bytes, block: int = 64) -> bytes:
@@ -358,9 +392,13 @@ async def open_vmess_outbound(
     cfg: dict,
     target_host: str,
     target_port: int,
-    timeout: float = 6.0,
+    timeout: float = 10.0,
+    trace: Optional[DiagnosticTrace] = None,
 ) -> VMessTunnelStream:
-    """Connect to an external VMess server and open a tunnel to target_host:target_port."""
+    """Connect to an external VMess server and open a tunnel to target_host:target_port with step-by-step diagnostic trace."""
+    if trace is None:
+        trace = DiagnosticTrace()
+
     server_addr = cfg["address"]
     server_port = cfg["port"]
     use_tls = cfg["tls"]
@@ -370,24 +408,75 @@ async def open_vmess_outbound(
     sni = cfg["sni"]
     uuid_obj = _uuid.UUID(cfg["uuid"])
 
-    # 1. Open TCP or TLS socket to server
+    trace.add(
+        "CONFIG", "info",
+        f"آنالیز کانفیگ: {server_addr}:{server_port} (شبکه: {net}{'+tls' if use_tls else ''})",
+        f"UUID: {uuid_obj} | Path: {ws_path} | SNI: {sni}"
+    )
+
+    # 1. DNS Resolution
+    resolved_ip = server_addr
+    is_domain = False
+    try:
+        ipaddress.ip_address(server_addr)
+        trace.add("DNS", "info", f"آدرس به صورت IP مستقیم است ({server_addr})")
+    except ValueError:
+        is_domain = True
+        trace.add("DNS", "info", f"در حال استعلام DNS برای دامنه {server_addr}...")
+        dns_start = time.monotonic()
+        try:
+            loop = asyncio.get_running_loop()
+            addr_info = await asyncio.wait_for(
+                loop.getaddrinfo(server_addr, server_port, proto=socket.IPPROTO_TCP),
+                timeout=min(4.0, timeout)
+            )
+            resolved_ip = addr_info[0][4][0]
+            dns_time = round((time.monotonic() - dns_start) * 1000, 1)
+            trace.add("DNS", "ok", f"استعلام DNS موفق: {server_addr} -> {resolved_ip}", f"زمان پاسخ: {dns_time}ms")
+        except Exception as exc:
+            trace.add("DNS", "error", f"خطا در حل نام دامنه DNS: {exc}", "دامنه مسدود است یا رکورد معتبر ندارد")
+            raise
+
+    # 2. Open TCP Socket (and optional TLS)
     ssl_ctx = None
     if use_tls:
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
 
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(
-            server_addr,
-            server_port,
-            ssl=ssl_ctx,
-            server_hostname=sni if use_tls else None,
-        ),
-        timeout=timeout,
+    trace.add(
+        "TCP", "info",
+        f"در حال اتصال سوکت TCP به {resolved_ip}:{server_port}...",
+        f"مهلت اتصال: {timeout}s"
     )
+    tcp_start = time.monotonic()
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(
+                server_addr,
+                server_port,
+                ssl=ssl_ctx,
+                server_hostname=sni if use_tls else None,
+            ),
+            timeout=timeout,
+        )
+        tcp_ms = round((time.monotonic() - tcp_start) * 1000, 1)
+        trace.add("TCP", "ok", f"اتصال سوکت TCP برقرار شد ({tcp_ms}ms)")
+        if use_tls:
+            trace.add("TLS", "ok", f"هندشیک امنیتی TLS با موفقیت انجام شد (SNI: {sni})")
+        else:
+            trace.add("TLS", "info", "ارتباط مستقیم ساده (بدون TLS)")
+    except asyncio.TimeoutError:
+        trace.add("TCP", "error", f"مهلت اتصال به {resolved_ip}:{server_port} تمام شد (Timeout)", "پورت بسته است یا توسط فیلترینگ مسدود شده")
+        raise
+    except ConnectionRefusedError:
+        trace.add("TCP", "error", f"اتصال رد شد (Connection Refused): پورت {server_port} بسته است", "هیچ سرویسی روی این پورت در حال شنود نیست")
+        raise
+    except Exception as exc:
+        trace.add("TCP", "error", f"خطا در برقراری سوکت: {exc}")
+        raise
 
-    # 2. WebSocket upgrade if needed
+    # 3. WebSocket upgrade if needed
     if net == "ws":
         ws_key = base64.b64encode(secrets.token_bytes(16)).decode()
         req_lines = [
@@ -400,15 +489,25 @@ async def open_vmess_outbound(
             "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
             "\r\n",
         ]
+        trace.add("WS", "info", f"ارسال درخواست ارتقای وب‌سوکت به مسیر {ws_path} (Host: {ws_host})...")
         writer.write("\r\n".join(req_lines).encode())
         await writer.drain()
 
-        resp_header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
-        if b" 101 " not in resp_header:
+        try:
+            resp_header = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+            status_line = resp_header.split(b"\r\n")[0].decode(errors="ignore")
+            if b" 101 " in resp_header:
+                trace.add("WS", "ok", f"ارتقای وب‌سوکت تایید شد ({status_line})")
+            else:
+                trace.add("WS", "error", f"سرور ارتقای وب‌سوکت را رد کرد: {status_line}", f"پاسخ هدر: {resp_header[:250].decode(errors='ignore')}")
+                writer.close()
+                raise ConnectionError(f"WebSocket upgrade rejected: {status_line}")
+        except asyncio.TimeoutError:
+            trace.add("WS", "error", "سرور به درخواست وب‌سوکت در مهلت زمانی پاسخ نداد (Timeout)")
             writer.close()
-            raise ConnectionError(f"WebSocket upgrade rejected by {server_addr}:{server_port}")
+            raise
 
-    # 3. Build VMess AEAD Client Request Header
+    # 4. Build VMess AEAD Client Request Header
     cmd_key = hashlib.md5(uuid_obj.bytes + _VMESS_CMDKEY_SALT).digest()
 
     now_ts = int(time.time())
@@ -464,37 +563,60 @@ async def open_vmess_outbound(
 
     client_handshake = auth_id + enc_len + nonce + enc_hdr
 
+    trace.add(
+        "AUTH", "info",
+        f"ارسال بسته احراز هویت VMess AEAD ({len(client_handshake)} بایت)...",
+        f"مقصد تونل: {target_host}:{target_port}"
+    )
+
     if net == "ws":
         writer.write(_encode_ws_frame(client_handshake, opcode=2))
     else:
         writer.write(client_handshake)
     await writer.drain()
 
-    # 4. Decrypt server response header
+    # 5. Decrypt server response header
     rk = hashlib.sha256(body_key).digest()[:16]
     ri = hashlib.sha256(body_iv).digest()[:16]
 
-    if net == "ws":
-        _, resp_payload = await _read_ws_frame(reader)
-        resp_stream = asyncio.StreamReader()
-        resp_stream.feed_data(resp_payload)
-        resp_stream.feed_eof()
-    else:
-        resp_stream = reader
+    trace.add("AUTH", "info", "در انتظار پاسخ هدر تاییدیه از سرور VMess...")
+    try:
+        if net == "ws":
+            _, resp_payload = await asyncio.wait_for(_read_ws_frame(reader), timeout=timeout)
+            resp_stream = asyncio.StreamReader()
+            resp_stream.feed_data(resp_payload)
+            resp_stream.feed_eof()
+        else:
+            resp_stream = reader
 
-    lk2 = vmess_kdf16(rk, b"AEAD Resp Header Len Key")
-    ln2 = vmess_kdf(ri, b"AEAD Resp Header Len IV")[:12]
-    resp_enc_len = await resp_stream.readexactly(18)
-    resp_len = struct.unpack(">H", AESGCM(lk2).decrypt(ln2, resp_enc_len, None))[0]
+        lk2 = vmess_kdf16(rk, b"AEAD Resp Header Len Key")
+        ln2 = vmess_kdf(ri, b"AEAD Resp Header Len IV")[:12]
+        resp_enc_len = await asyncio.wait_for(resp_stream.readexactly(18), timeout=timeout)
+        resp_len = struct.unpack(">H", AESGCM(lk2).decrypt(ln2, resp_enc_len, None))[0]
 
-    hk2 = vmess_kdf16(rk, b"AEAD Resp Header Key")
-    hn2 = vmess_kdf(ri, b"AEAD Resp Header IV")[:12]
-    resp_enc_hdr = await resp_stream.readexactly(resp_len + 16)
-    resp_hdr = AESGCM(hk2).decrypt(hn2, resp_enc_hdr, None)
+        hk2 = vmess_kdf16(rk, b"AEAD Resp Header Key")
+        hn2 = vmess_kdf(ri, b"AEAD Resp Header IV")[:12]
+        resp_enc_hdr = await asyncio.wait_for(resp_stream.readexactly(resp_len + 16), timeout=timeout)
+        resp_hdr = AESGCM(hk2).decrypt(hn2, resp_enc_hdr, None)
 
-    if resp_hdr[0] != resp_v:
+        if resp_hdr[0] != resp_v:
+            writer.close()
+            trace.add("AUTH", "error", "کد اعتبارسنجی سرور همخوانی ندارد (Auth Mismatch)")
+            raise ConnectionError("VMess server response auth mismatch")
+
+        trace.add("AUTH", "ok", f"احراز هویت VMess با موفقیت تایید شد (طول هدر پاسخ: {resp_len} بایت)")
+    except asyncio.TimeoutError:
+        trace.add(
+            "AUTH", "error",
+            "سرور به بسته احراز هویت VMess پاسخی نداد (Timeout)",
+            "علل احتمالی: شناسه کاربری (UUID) اشتباه یا منقضی است، یا سرور بسته‌های پراکسی را فیلتر می‌کند"
+        )
         writer.close()
-        raise ConnectionError("VMess server response auth mismatch")
+        raise
+    except Exception as exc:
+        trace.add("AUTH", "error", f"خطا در رمزگشایی پاسخ سرور: {exc}")
+        writer.close()
+        raise
 
     enc_crypto = _VMessChunkCrypto(security, body_key, body_iv, opt)
     dec_crypto = _VMessChunkCrypto(security, rk, ri, opt)
@@ -558,7 +680,8 @@ async def vmess_connect_stream_pair(
 # Proxy Connectivity & Latency Tester
 # ══════════════════════════════════════════════════════════════════════════════
 async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
-    """Test connecting through a VMess proxy to verify latency and egress IP."""
+    """Test connecting through a VMess proxy with multi-target probe and step-by-step diagnostic logging."""
+    trace = DiagnosticTrace()
     result = {
         "protocol": "vmess",
         "ping_ms": None,
@@ -568,53 +691,88 @@ async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
         "country_flag": "",
         "working": False,
         "error": "",
+        "diagnosis_fa": "",
+        "trace": [],
+        "trace_text": "",
         "remark": vmess_cfg.get("ps") or "",
         "host": vmess_cfg.get("address") or "",
         "port": vmess_cfg.get("port") or 443,
     }
+
     tunnel = None
     started = time.monotonic()
+    probe_target = "cp.cloudflare.com"
+    probe_port = 80
+
     try:
-        tunnel = await asyncio.wait_for(
-            open_vmess_outbound(vmess_cfg, "api.ipify.org", 80, timeout=timeout),
-            timeout=timeout,
-        )
+        # Phase 1: Open tunnel with detailed tracing
+        tunnel = await open_vmess_outbound(vmess_cfg, probe_target, probe_port, timeout=timeout, trace=trace)
         ping_ms = round((time.monotonic() - started) * 1000, 1)
         result["ping_ms"] = ping_ms
 
-        req = b"GET /?format=json HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n"
-        await tunnel.write(req)
+        # Phase 2: Probe internet traffic (HTTP 204 via Cloudflare)
+        trace.add("PROBE", "info", f"ارسال درخواست HTTP به {probe_target}:{probe_port}/generate_204...")
+        probe_req = f"GET /generate_204 HTTP/1.1\r\nHost: {probe_target}\r\nConnection: close\r\n\r\n".encode()
+        await tunnel.write(probe_req)
 
-        resp_data = await asyncio.wait_for(tunnel.read(1024), timeout=3.0)
+        resp_data = await asyncio.wait_for(tunnel.read(1024), timeout=min(4.0, timeout))
         resp_text = resp_data.decode("utf-8", errors="ignore")
-
-        ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', resp_text)
-        if ip_match:
-            result["egress_ip"] = ip_match.group(1).strip()
+        if b"204" in resp_data or b"200" in resp_data or b"HTTP/1." in resp_data:
+            trace.add("PROBE", "ok", f"دریافت پاسخ معتبر از اینترنت ({resp_text.splitlines()[0] if resp_text else 'HTTP 204 OK'})")
+            result["working"] = True
+            result["diagnosis_fa"] = "کانفیگ سالم است و ترافیک اینترنت را با موفقیت عبور می‌دهد."
         else:
-            ips = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", resp_text)
-            if ips:
-                result["egress_ip"] = ips[0]
+            trace.add("PROBE", "warn", f"پاسخ غیرمنتظره از تارگت: {resp_text[:100]}")
+            result["working"] = True
+            result["diagnosis_fa"] = "ارتباط با سرور برقرار شد، اما پاسخ وب نامتعارف بود."
 
-        result["working"] = True
+        # Phase 3: Fetch Egress IP if possible
+        try:
+            ip_tunnel = await open_vmess_outbound(vmess_cfg, "api.ipify.org", 80, timeout=min(5.0, timeout))
+            await ip_tunnel.write(b"GET /?format=json HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
+            ip_data = await asyncio.wait_for(ip_tunnel.read(1024), timeout=3.0)
+            ip_text = ip_data.decode("utf-8", errors="ignore")
+            await ip_tunnel.close()
+            ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', ip_text)
+            if ip_match:
+                result["egress_ip"] = ip_match.group(1).strip()
+                trace.add("PROBE", "ok", f"آی‌پی خروجی سرور شناسایی شد: {result['egress_ip']}")
+            else:
+                ips = re.findall(r"(?:\d{1,3}\.){3}\d{1,3}", ip_text)
+                if ips:
+                    result["egress_ip"] = ips[0]
+                    trace.add("PROBE", "ok", f"آی‌پی خروجی سرور شناسایی شد: {result['egress_ip']}")
+        except Exception as _e_ip:
+            trace.add("PROBE", "info", f"استعلام آی‌پی خروجی رد شد: {_e_ip}")
+
     except asyncio.TimeoutError:
-        result["error"] = "سرور پاسخ نمی‌دهد (Timeout / مسدود است)"
+        result["error"] = "سرور پاسخ نمی‌دهد (Timeout)"
+        last_stage = trace.logs[-1]["stage"] if trace.logs else "UNKNOWN"
+        if last_stage in ("TCP", "DNS"):
+            result["diagnosis_fa"] = "آی‌پی سرور در شبکه در دسترس نیست یا پورت توسط فیلترینگ مسدود شده است."
+        elif last_stage == "AUTH":
+            result["diagnosis_fa"] = "سوکت وصل شد اما سرور بسته احراز هویت VMess را رد کرد؛ احتمالاً UUID منقضی است یا پکت‌ها مسدود می‌شوند."
+        else:
+            result["diagnosis_fa"] = "مهلت زمانی تمام شد (Timeout)."
     except ConnectionRefusedError:
-        result["error"] = "ارتباط رد شد (پورت مقصد بسته است)"
+        result["error"] = "ارتباط رد شد (پورت بسته است)"
+        result["diagnosis_fa"] = "پورت مقصد روی سرور بسته است یا سرویسی روی آن اجرا نمی‌شود."
     except ConnectionResetError:
-        result["error"] = "ارتباط قطع شد (احتمالاً کانفیگ نامعتبر یا منقضی)"
+        result["error"] = "ارتباط قطع شد (Connection Reset)"
+        result["diagnosis_fa"] = "اتصال بلافاصله توسط سرور یا سیستم فیلترینگ ریست شد."
     except Exception as exc:
         msg = str(exc)
+        result["error"] = msg[:160] or type(exc).__name__
         if "WebSocket upgrade rejected" in msg:
-            result["error"] = "وب‌سوکت رد شد (سایت مقصد مسدود یا 404)"
-        elif "Name or service not known" in msg or "getaddrinfo failed" in msg:
-            result["error"] = "آدرس دامنه سرور یافت نشد (DNS Error)"
-        elif type(exc).__name__ == "TimeoutError":
-            result["error"] = "سرور پاسخ نمی‌دهد (Timeout / مسدود است)"
+            result["diagnosis_fa"] = "مسیر وب‌سوکت اشتباه است یا ورکر/CDN سرویس‌دهنده غیرفعال شده است (404/403)."
+        elif "getaddrinfo failed" in msg or "Name or service not known" in msg:
+            result["diagnosis_fa"] = "نام دامنه سرور یافت نشد؛ دامنه فاقد رکورد معتبر است یا DNS مسدود شده."
         else:
-            result["error"] = msg[:160] or type(exc).__name__
+            result["diagnosis_fa"] = f"خطا در برقراری ارتباط: {result['error']}"
     finally:
         if tunnel:
             await tunnel.close()
 
+    result["trace"] = trace.to_list()
+    result["trace_text"] = trace.to_text()
     return result
