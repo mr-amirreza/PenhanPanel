@@ -67,22 +67,30 @@ class DiagnosticTrace:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Crypto Helpers (Aligned with relays.py & VMess AEAD standard)
+# ══════════════════════════════════════════════════════════════════════════════
+# Crypto Helpers (Aligned with relays.py & standard Go VMess AEAD KDF)
 # ══════════════════════════════════════════════════════════════════════════════
 def _hmac_custom(hash_fn, key: bytes, msg: bytes, block: int = 64) -> bytes:
+    """HMAC whose 'hash' is an arbitrary one-shot function (VMess nested KDF)."""
     if len(key) > block:
-        key = hash_fn(key).digest()
+        key = hash_fn(key)
     key = key.ljust(block, b"\x00")
-    o = bytes(x ^ 0x5C for x in key)
-    i = bytes(x ^ 0x36 for x in key)
-    return hash_fn(o + hash_fn(i + msg).digest()).digest()
+    ipad = bytes(b ^ 0x36 for b in key)
+    opad = bytes(b ^ 0x5C for b in key)
+    return hash_fn(opad + hash_fn(ipad + msg))
 
 
 def vmess_kdf(key: bytes, *path: bytes) -> bytes:
-    h = hmac.new(b"VMess AEAD KDF", key, hashlib.sha256).digest()
-    for p in path:
-        h = hmac.new(h, p, hashlib.sha256).digest()
-    return h
+    """Official Go-compatible recursive HMAC VMess AEAD KDF."""
+    def level(n: int):
+        if n == 0:
+            return lambda data: hmac.new(b"VMess AEAD KDF", data, hashlib.sha256).digest()
+        parent = level(n - 1)
+        k = path[n - 1]
+        if isinstance(k, str):
+            k = k.encode("utf-8")
+        return lambda data: _hmac_custom(parent, k, data)
+    return level(len(path))(key)
 
 
 def vmess_kdf16(key: bytes, *path: bytes) -> bytes:
@@ -97,21 +105,24 @@ def _fnv1a32(data: bytes) -> int:
 
 
 def _chacha_key(key16: bytes) -> bytes:
-    return hashlib.md5(key16).digest() + hashlib.md5(key16 + b"chachapoly").digest()
+    first = hashlib.md5(key16).digest()
+    return first + hashlib.md5(first).digest()
 
 
 class _Shake:
-    """SHAKE128-based pseudo-random generator for length masking/padding."""
+    """Lazy SHAKE128 pseudo-random generator with dynamic expansion."""
     def __init__(self, seed: bytes):
-        self._val = bytearray(hashlib.shake_128(seed).digest(1024))
-        self._pos = 0
+        self.seed = seed
+        self.size = 2048
+        self.data = hashlib.shake_128(seed).digest(self.size)
+        self.pos = 0
 
     def next16(self) -> int:
-        if self._pos + 2 > len(self._val):
-            self._val = bytearray(hashlib.shake_128(self._val).digest(1024))
-            self._pos = 0
-        v = (self._val[self._pos] << 8) | self._val[self._pos + 1]
-        self._pos += 2
+        if self.pos + 2 > self.size:
+            self.size *= 2
+            self.data = hashlib.shake_128(self.seed).digest(self.size)
+        v = (self.data[self.pos] << 8) | self.data[self.pos + 1]
+        self.pos += 2
         return v
 
 
@@ -329,16 +340,51 @@ async def _read_ws_frame(reader: asyncio.StreamReader) -> Tuple[int, bytes]:
 # VMess Tunnel Connection
 # ══════════════════════════════════════════════════════════════════════════════
 class VMessTunnelStream:
-    """Provides transparent read/write over a live VMess outbound connection."""
-    def __init__(self, raw_reader: asyncio.StreamReader, raw_writer: asyncio.StreamWriter,
-                 enc: _VMessChunkCrypto, dec: _VMessChunkCrypto, is_ws: bool = False):
+    """Provides transparent read/write over a live VMess outbound connection (TCP or WebSocket)."""
+    def __init__(
+        self,
+        raw_reader: asyncio.StreamReader,
+        raw_writer: asyncio.StreamWriter,
+        enc: _VMessChunkCrypto,
+        dec: _VMessChunkCrypto,
+        resp_len_key: bytes,
+        resp_len_iv: bytes,
+        resp_hdr_key: bytes,
+        resp_hdr_iv: bytes,
+        expected_resp_v: int,
+        is_ws: bool = False,
+        trace: Optional[DiagnosticTrace] = None,
+    ):
         self.raw_reader = raw_reader
         self.raw_writer = raw_writer
         self.enc = enc
         self.dec = dec
+        self.resp_len_key = resp_len_key
+        self.resp_len_iv = resp_len_iv
+        self.resp_hdr_key = resp_hdr_key
+        self.resp_hdr_iv = resp_hdr_iv
+        self.expected_resp_v = expected_resp_v
         self.is_ws = is_ws
+        self.trace = trace
+
+        self._header_decrypted = False
+        self._raw_ws_buf = bytearray()
         self._read_buf = bytearray()
         self._closed = False
+
+    async def _read_exact(self, count: int) -> bytes:
+        if not self.is_ws:
+            return await self.raw_reader.readexactly(count)
+        while len(self._raw_ws_buf) < count:
+            opcode, payload = await _read_ws_frame(self.raw_reader)
+            if opcode == 8:  # WS Close frame
+                self._closed = True
+                raise asyncio.IncompleteReadError(bytes(self._raw_ws_buf), count)
+            if opcode in (1, 2) and payload:
+                self._raw_ws_buf.extend(payload)
+        out = bytes(self._raw_ws_buf[:count])
+        del self._raw_ws_buf[:count]
+        return out
 
     async def write(self, data: bytes):
         if self._closed or not data:
@@ -355,25 +401,53 @@ class VMessTunnelStream:
         if self._closed:
             return b""
         while not self._read_buf:
-            if self.is_ws:
-                opcode, payload = await _read_ws_frame(self.raw_reader)
-                if opcode == 8: # Close frame
+            if not self._header_decrypted:
+                if self.trace:
+                    self.trace.add("AUTH", "info", "در انتظار پاسخ هدر تاییدیه از سرور VMess...")
+                try:
+                    resp_enc_len = await self._read_exact(18)
+                    resp_len = struct.unpack(">H", AESGCM(self.resp_len_key).decrypt(self.resp_len_iv, resp_enc_len, None))[0]
+
+                    resp_enc_hdr = await self._read_exact(resp_len + 16)
+                    resp_hdr = AESGCM(self.resp_hdr_key).decrypt(self.resp_hdr_iv, resp_enc_hdr, None)
+
+                    if resp_hdr[0] != self.expected_resp_v:
+                        if self.trace:
+                            self.trace.add("AUTH", "error", "کد اعتبارسنجی سرور همخوانی ندارد (Auth Mismatch)")
+                        raise ConnectionError("VMess server response auth mismatch")
+
+                    self._header_decrypted = True
+                    if self.trace:
+                        self.trace.add("AUTH", "ok", f"احراز هویت VMess با موفقیت تایید شد (طول هدر پاسخ: {resp_len} بایت)")
+                except Exception as exc:
+                    if self.trace:
+                        self.trace.add("AUTH", "error", f"خطا در تایید احراز هویت سرور: {exc}")
+                    raise
+
+            # Read next body chunk
+            try:
+                if self.dec.auth_len:
+                    len_b = await self._read_exact(18)
+                    nonce = struct.pack(">H", self.dec.len_count) + self.dec.iv[2:12]
+                    self.dec.len_count += 1
+                    length = struct.unpack(">H", self.dec.len_aead.decrypt(nonce, len_b, None))[0]
+                else:
+                    len_b = await self._read_exact(2)
+                    masked = struct.unpack(">H", len_b)[0]
+                    length = masked ^ (self.dec.shake.next16() if self.dec.masking else 0)
+
+                if length == 0:
                     self._closed = True
                     return b""
-                if not payload:
-                    continue
-                chunk_stream = asyncio.StreamReader()
-                chunk_stream.feed_data(payload)
-                chunk_stream.feed_eof()
-                plain = await self.dec.read_chunk(chunk_stream)
-                if plain:
-                    self._read_buf.extend(plain)
-            else:
-                plain = await self.dec.read_chunk(self.raw_reader)
-                if not plain:
-                    self._closed = True
-                    return b""
+
+                enc = await self._read_exact(length)
+                nonce = self.dec._nonce(self.dec.count)
+                self.dec.count += 1
+                plain = self.dec.aead.decrypt(nonce, enc, None)
                 self._read_buf.extend(plain)
+            except (asyncio.IncompleteReadError, ConnectionResetError):
+                self._closed = True
+                return b""
 
         out = bytes(self._read_buf[:n])
         del self._read_buf[:n]
@@ -575,53 +649,31 @@ async def open_vmess_outbound(
         writer.write(client_handshake)
     await writer.drain()
 
-    # 5. Decrypt server response header
+    # 5. Prepare response decryption keys
     rk = hashlib.sha256(body_key).digest()[:16]
     ri = hashlib.sha256(body_iv).digest()[:16]
 
-    trace.add("AUTH", "info", "در انتظار پاسخ هدر تاییدیه از سرور VMess...")
-    try:
-        if net == "ws":
-            _, resp_payload = await asyncio.wait_for(_read_ws_frame(reader), timeout=timeout)
-            resp_stream = asyncio.StreamReader()
-            resp_stream.feed_data(resp_payload)
-            resp_stream.feed_eof()
-        else:
-            resp_stream = reader
-
-        lk2 = vmess_kdf16(rk, b"AEAD Resp Header Len Key")
-        ln2 = vmess_kdf(ri, b"AEAD Resp Header Len IV")[:12]
-        resp_enc_len = await asyncio.wait_for(resp_stream.readexactly(18), timeout=timeout)
-        resp_len = struct.unpack(">H", AESGCM(lk2).decrypt(ln2, resp_enc_len, None))[0]
-
-        hk2 = vmess_kdf16(rk, b"AEAD Resp Header Key")
-        hn2 = vmess_kdf(ri, b"AEAD Resp Header IV")[:12]
-        resp_enc_hdr = await asyncio.wait_for(resp_stream.readexactly(resp_len + 16), timeout=timeout)
-        resp_hdr = AESGCM(hk2).decrypt(hn2, resp_enc_hdr, None)
-
-        if resp_hdr[0] != resp_v:
-            writer.close()
-            trace.add("AUTH", "error", "کد اعتبارسنجی سرور همخوانی ندارد (Auth Mismatch)")
-            raise ConnectionError("VMess server response auth mismatch")
-
-        trace.add("AUTH", "ok", f"احراز هویت VMess با موفقیت تایید شد (طول هدر پاسخ: {resp_len} بایت)")
-    except asyncio.TimeoutError:
-        trace.add(
-            "AUTH", "error",
-            "سرور به بسته احراز هویت VMess پاسخی نداد (Timeout)",
-            "علل احتمالی: شناسه کاربری (UUID) اشتباه یا منقضی است، یا سرور بسته‌های پراکسی را فیلتر می‌کند"
-        )
-        writer.close()
-        raise
-    except Exception as exc:
-        trace.add("AUTH", "error", f"خطا در رمزگشایی پاسخ سرور: {exc}")
-        writer.close()
-        raise
+    resp_len_key = vmess_kdf16(rk, b"AEAD Resp Header Len Key")
+    resp_len_iv = vmess_kdf(ri, b"AEAD Resp Header Len IV")[:12]
+    resp_hdr_key = vmess_kdf16(rk, b"AEAD Resp Header Key")
+    resp_hdr_iv = vmess_kdf(ri, b"AEAD Resp Header IV")[:12]
 
     enc_crypto = _VMessChunkCrypto(security, body_key, body_iv, opt)
     dec_crypto = _VMessChunkCrypto(security, rk, ri, opt)
 
-    tunnel = VMessTunnelStream(reader, writer, enc_crypto, dec_crypto, is_ws=(net == "ws"))
+    tunnel = VMessTunnelStream(
+        raw_reader=reader,
+        raw_writer=writer,
+        enc=enc_crypto,
+        dec=dec_crypto,
+        resp_len_key=resp_len_key,
+        resp_len_iv=resp_len_iv,
+        resp_hdr_key=resp_hdr_key,
+        resp_hdr_iv=resp_hdr_iv,
+        expected_resp_v=resp_v,
+        is_ws=(net == "ws"),
+        trace=trace,
+    )
     return tunnel
 
 
@@ -715,12 +767,14 @@ async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
         probe_req = f"GET /generate_204 HTTP/1.1\r\nHost: {probe_target}\r\nConnection: close\r\n\r\n".encode()
         await tunnel.write(probe_req)
 
-        resp_data = await asyncio.wait_for(tunnel.read(1024), timeout=min(4.0, timeout))
+        resp_data = await asyncio.wait_for(tunnel.read(1024), timeout=min(6.0, timeout))
+        ping_ms = round((time.monotonic() - started) * 1000, 1)
+        result["ping_ms"] = ping_ms
         resp_text = resp_data.decode("utf-8", errors="ignore")
         if b"204" in resp_data or b"200" in resp_data or b"HTTP/1." in resp_data:
-            trace.add("PROBE", "ok", f"دریافت پاسخ معتبر از اینترنت ({resp_text.splitlines()[0] if resp_text else 'HTTP 204 OK'})")
+            trace.add("PROBE", "ok", f"دریافت پاسخ معتبر از اینترنت ({resp_text.splitlines()[0] if resp_text else 'HTTP 204 OK'})", f"تاخیر رفت‌وبرگشت (Real Delay): {ping_ms}ms")
             result["working"] = True
-            result["diagnosis_fa"] = "کانفیگ سالم است و ترافیک اینترنت را با موفقیت عبور می‌دهد."
+            result["diagnosis_fa"] = f"کانفیگ سالم است و ترافیک اینترنت را با موفقیت عبور می‌دهد (پینگ واقعی: {ping_ms}ms)."
         else:
             trace.add("PROBE", "warn", f"پاسخ غیرمنتظره از تارگت: {resp_text[:100]}")
             result["working"] = True
@@ -730,7 +784,7 @@ async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
         try:
             ip_tunnel = await open_vmess_outbound(vmess_cfg, "api.ipify.org", 80, timeout=min(5.0, timeout))
             await ip_tunnel.write(b"GET /?format=json HTTP/1.1\r\nHost: api.ipify.org\r\nConnection: close\r\n\r\n")
-            ip_data = await asyncio.wait_for(ip_tunnel.read(1024), timeout=3.0)
+            ip_data = await asyncio.wait_for(ip_tunnel.read(1024), timeout=4.0)
             ip_text = ip_data.decode("utf-8", errors="ignore")
             await ip_tunnel.close()
             ip_match = re.search(r'"ip"\s*:\s*"([^"]+)"', ip_text)
@@ -744,6 +798,32 @@ async def test_vmess_proxy(vmess_cfg: dict, timeout: float = 10.0) -> dict:
                     trace.add("PROBE", "ok", f"آی‌پی خروجی سرور شناسایی شد: {result['egress_ip']}")
         except Exception as _e_ip:
             trace.add("PROBE", "info", f"استعلام آی‌پی خروجی رد شد: {_e_ip}")
+
+        # Resolve country metadata
+        rem = vmess_cfg.get("ps") or ""
+        match_flag = re.search(r"[\U0001F1E6-\U0001F1FF]{2}", rem)
+        if match_flag:
+            result["country_flag"] = match_flag.group(0)
+            c1 = chr(ord(result["country_flag"][0]) - 127397)
+            c2 = chr(ord(result["country_flag"][1]) - 127397)
+            result["country_code"] = (c1 + c2).upper()
+        if not result["country_code"]:
+            m_code = re.search(r"\b(US|DE|FR|GB|UK|NL|FI|TR|CA|SG|JP|KR|AE|PL|SE|CH)\b", rem.upper())
+            if m_code:
+                c = m_code.group(1)
+                if c == "UK": c = "GB"
+                result["country_code"] = c
+                result["country_flag"] = chr(127397 + ord(c[0])) + chr(127397 + ord(c[1]))
+        if not result["country_flag"]:
+            result["country_flag"] = "🌐"
+        if not result["country"]:
+            names_map = {
+                "US": "United States", "DE": "Germany", "FR": "France", "GB": "United Kingdom",
+                "NL": "Netherlands", "FI": "Finland", "TR": "Turkey", "CA": "Canada",
+                "SG": "Singapore", "JP": "Japan", "KR": "South Korea", "AE": "UAE",
+                "PL": "Poland", "SE": "Sweden", "CH": "Switzerland", "IR": "Iran"
+            }
+            result["country"] = names_map.get(result["country_code"], result["country_code"] or "External VMess")
 
     except asyncio.TimeoutError:
         result["error"] = "سرور پاسخ نمی‌دهد (Timeout)"
